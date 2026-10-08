@@ -1,0 +1,38 @@
+# sdr.conf — SDR server configuration.
+#
+# This file is sourced by the `sdr` script. Each "server" below maps one
+# physical RTL-SDR dongle to one rtl_tcp instance.
+#
+# To discover your devices and their serials, run:  sdr list
+# To see which are currently in use (e.g. by an ADS-B feeder), run:  sdr status
+
+# --- global defaults --------------------------------------------------------
+# Address rtl_tcp listens on (0.0.0.0 = all interfaces).
+LISTEN_ADDRESS="0.0.0.0"
+
+# Defaults applied to every server unless that server overrides them.
+DEFAULT_SAMPLE_RATE="2048000"
+DEFAULT_GAIN="0"        # 0 = automatic gain
+
+# --- servers ----------------------------------------------------------------
+# Space-separated list of server names you want to manage. Each name below
+# needs a matching block of SDR_<name>_* settings.
+SERVERS="radio"
+
+# --- server: radio ----------------------------------------------------------
+SDR_radio_SERIAL="00000000"   # REQUIRED — set to your device's serial (see `sdr list`)
+SDR_radio_PORT="1234"         # REQUIRED — TCP port for rtl_tcp
+
+# Optional tuning/behaviour overrides (defaults come from the globals above):
+#SDR_radio_FREQUENCY="100100000"  # initial tune freq in Hz (e.g. 100.1 MHz FM)
+#SDR_radio_GAIN="28.0"            # gain in dB (default: 0 = auto)
+#SDR_radio_SAMPLE_RATE="2048000"  # for FM broadcast 2.4 MS/s is plenty
+#SDR_radio_PPM="0"                # oscillator correction, ppm
+#SDR_radio_BIAS_TEE="0"           # 1 = enable bias-T (rtl-sdr.com v3 dongles)
+#SDR_radio_DIRECT_SAMPLING="0"    # 0 = off, 1 = I branch, 2 = Q branch
+#SDR_radio_EXTRA_ARGS=""          # any extra rtl_tcp arguments
+
+# --- example: a second server on another dongle -----------------------------
+# SERVERS="radio adsb"
+# SDR_adsb_SERIAL="00000000"
+# SDR_adsb_PORT="1235"

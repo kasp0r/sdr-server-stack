@@ -1,0 +1,26 @@
+# systemd template unit for a single rtl_tcp SDR server.
+#
+# Install:
+#   sudo cp systemd/sdr-rtl-tcp@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now sdr-rtl-tcp@radio.service
+#
+# The instance name ("radio" above) must match a name in SERVERS in sdr.conf.
+# Set SDR_PATH to the absolute location of the `sdr` script if it is not /opt/sdr-server.
+
+[Unit]
+Description=SDR rtl_tcp server (%i)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/sdr-server/sdr run %i
+ExecStop=/opt/sdr-server/sdr stop %i
+Restart=on-failure
+RestartSec=3
+# USB device access — uncomment/adjust as needed:
+# SupplementaryGroups=plugdev
+# User=sdr
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+# sdr — helper CLI to inventory, start, monitor and stop rtl_tcp SDR servers.
+#
+# Usage: sdr <command> [args]
+#   sdr list|ls              list physical SDRs and whether they are in use
+#   sdr status|st [name]     show configured servers and their running state
+#   sdr init|setup [--force] [path]  generate a config from attached SDRs
+#   sdr start <name|all>     start rtl_tcp for one or all servers
+#   sdr stop <name|all>      stop one or all servers
+#   sdr restart <name|all>   stop then start
+#   sdr logs <name>          show recent log output
+#   sdr monitor <name>       follow a server's log (Ctrl-C to exit)
+#   sdr run <name>           run one server in the foreground (for systemd)
+#   sdr help                 this help
+
+set -u
+
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/sdr-lib.sh
+. "$SRC_DIR/lib/sdr-lib.sh"
+
+usage() {
+  sed -n '2,/^set -u/p' "$SRC_DIR/sdr" | sed '/^set -u/d; s/^# \{0,1\}//'
+}
+
+state_color() {
+  case "$1" in
+    free)     echo "${C_GREEN}free${C_RESET}" ;;
+    in-use)   echo "${C_RED}in use${C_RESET}" ;;
+    kernel)   echo "${C_YELLOW}kernel driver${C_RESET}" ;;
+    missing)  echo "${C_RED}missing${C_RESET}" ;;
+    *)        echo "$1" ;;
+  esac
+}
+
+bool_color() {
+  if [ "$1" = "yes" ]; then echo "${C_GREEN}yes${C_RESET}"; else echo "${C_DIM}no${C_RESET}"; fi
+}
+
+# ---------------------------------------------------------------------------
+# list — physical inventory
+# ---------------------------------------------------------------------------
+cmd_list() {
+  sdr_scan
+  if [ "${#SDR_SERIALS[@]}" -eq 0 ]; then
+    echo "No RTL-SDR devices (0bda:2838) detected on the USB bus." >&2
+    echo "Check cabling and USB permissions." >&2
+    return 1
+  fi
+  printf '%s\n' "${C_BOLD}Physical SDR devices:${C_RESET}"
+  local serial
+  for serial in "${SDR_SERIALS[@]}"; do
+    local sym="${SDR_SYMLINK[$serial]}"
+    local state="$(state_color "${SDR_STATE[$serial]}")"
+    local who="$(sdr_device_process "$serial")"
+    printf '  %-16s serial=%-10s %s %s  [%s]\n' \
+      "${sym:-—}" "$serial" "${SDR_MANUFACTURER[$serial]} ${SDR_PRODUCT[$serial]}" \
+      "$state" "bus ${SDR_BUSNUM[$serial]} dev ${SDR_DEVNUM[$serial]}"
+    if [ -n "$who" ]; then
+      printf '    %sused by %s%s\n' "$C_DIM" "$who" "$C_RESET"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# status — configured servers
+# ---------------------------------------------------------------------------
+cmd_status() {
+  sdr_load_config || return 1
+  sdr_scan
+  if [ -z "$SERVERS" ]; then
+    echo "No servers configured (SERVERS is empty in $CONF_FILE)." >&2
+    return 1
+  fi
+  local filter="${1:-}"
+  printf '%s\n' "${C_BOLD}Configured SDR servers:${C_RESET}"
+  local name
+  for name in $SERVERS; do
+    [ -n "$filter" ] && [ "$name" != "$filter" ] && continue
+    local serial port
+    serial="$(sdr_cfg "$name" SERIAL)"
+    port="$(sdr_cfg "$name" PORT)"
+    local running="no" pid=""
+    if sdr_server_running "$name"; then
+      running="yes"; pid="$(sdr_server_pid "$name")"
+    fi
+    local listening="no"
+    sdr_port_in_use "$port" && listening="yes"
+    local devstate="$(sdr_state_of "$serial")"
+    printf '  %s\n' "${C_BOLD}${name}${C_RESET}"
+    printf '    serial=%-10s port=%s  running=%s (pid %s)  port-open=%s  device=%s\n' \
+      "$serial" "$port" "$(bool_color "$running")" "${pid:--}" \
+      "$(bool_color "$listening")" "$(state_color "$devstate")"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# start
+# ---------------------------------------------------------------------------
+do_start() {
+  local name="$1" serial port state
+  sdr_valid_server "$name" || { echo "error: unknown server '$name'" >&2; return 1; }
+  serial="$(sdr_cfg "$name" SERIAL)"
+  port="$(sdr_cfg "$name" PORT)"
+  [ -n "$serial" ] || { echo "error: $name: SERIAL not set" >&2; return 1; }
+  [ -n "$port" ]   || { echo "error: $name: PORT not set" >&2; return 1; }
+
+  if sdr_server_running "$name"; then
+    echo "$name: already running (pid $(sdr_server_pid "$name"))"
+    return 0
+  fi
+
+  state="$(sdr_state_of "$serial")"
+  case "$state" in
+    missing)
+      echo "error: $name: SDR with serial '$serial' not found" >&2; return 1 ;;
+    in-use)
+      echo "error: $name: SDR '$serial' is already in use by another process:" >&2
+      echo "       $(sdr_device_process "$serial")" >&2
+      echo "       stop that process first, or use a different SDR." >&2
+      return 1 ;;
+    kernel)
+      echo "error: $name: SDR '$serial' is claimed by the DVB kernel driver." >&2
+      echo "       Unbind it first, e.g.:" >&2
+      echo "         echo -n '1-3.3:1.0' | sudo tee /sys/bus/usb/drivers/dvb_usb_rtl28xxu/unbind" >&2
+      return 1 ;;
+  esac
+
+  if sdr_port_in_use "$port"; then
+    echo "error: $name: port $port is already in use." >&2
+    ss -tlnp "sport = :$port" 2>/dev/null | sed 's/^/       /' >&2
+    return 1
+  fi
+
+  mkdir -p "$PID_DIR" "$LOG_DIR"
+  sdr_build_cmd "$name"
+  echo "$name: starting -> $(sdr_cmd_string "$name")"
+  nohup "${CMD[@]}" >>"$(sdr_logfile "$name")" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$(sdr_pidfile "$name")"
+
+  # Give rtl_tcp a moment to claim the device and bind the port.
+  sleep 1
+  if kill -0 "$pid" 2>/dev/null && sdr_port_in_use "$port"; then
+    echo "$name: started (pid $pid) on port $port"
+  elif kill -0 "$pid" 2>/dev/null; then
+    echo "$name: process running but port $port not open yet — check:" >&2
+    echo "       $(sdr_logfile "$name")" >&2
+    tail -n 5 "$(sdr_logfile "$name")" | sed 's/^/       /' >&2
+  else
+    echo "error: $name: failed to start. Log:" >&2
+    tail -n 10 "$(sdr_logfile "$name")" | sed 's/^/       /' >&2
+    rm -f "$(sdr_pidfile "$name")"
+    return 1
+  fi
+}
+
+cmd_start() {
+  sdr_load_config || return 1
+  sdr_scan
+  sdr_servers_list "${1:-all}"
+  local name rc=0
+  for name in "${SERVER_TARGETS[@]}"; do
+    do_start "$name" || rc=1
+  done
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# stop
+# ---------------------------------------------------------------------------
+do_stop() {
+  local name="$1" pid
+  sdr_valid_server "$name" || { echo "error: unknown server '$name'" >&2; return 1; }
+  pid="$(sdr_server_pid "$name" 2>/dev/null)"
+  if [ -z "$pid" ]; then
+    echo "$name: not running"
+    rm -f "$(sdr_pidfile "$name")"
+    return 0
+  fi
+  echo "$name: stopping (pid $pid)"
+  kill "$pid" 2>/dev/null
+  local i
+  for i in 1 2 3 4 5; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "$name: still running, sending SIGKILL" >&2
+    kill -9 "$pid" 2>/dev/null
+  fi
+  rm -f "$(sdr_pidfile "$name")"
+  echo "$name: stopped"
+}
+
+cmd_stop() {
+  sdr_load_config || return 1
+  sdr_servers_list "${1:-all}"
+  local name rc=0
+  for name in "${SERVER_TARGETS[@]}"; do
+    do_stop "$name" || rc=1
+  done
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# restart / logs / monitor / run
+# ---------------------------------------------------------------------------
+cmd_restart() {
+  sdr_load_config || return 1
+  sdr_scan
+  sdr_servers_list "${1:-all}"
+  local name rc=0
+  for name in "${SERVER_TARGETS[@]}"; do
+    do_stop "$name" || rc=1
+    sleep 0.5
+    do_start "$name" || rc=1
+  done
+  return "$rc"
+}
+
+cmd_logs() {
+  sdr_load_config || return 1
+  local name="${1:-}"
+  [ -n "$name" ] || { echo "usage: sdr logs <name>" >&2; return 1; }
+  if [ ! -f "$(sdr_logfile "$name")" ]; then
+    echo "no log for '$name' yet: $(sdr_logfile "$name")" >&2
+    return 1
+  fi
+  tail -n 30 "$(sdr_logfile "$name")"
+}
+
+cmd_monitor() {
+  sdr_load_config || return 1
+  local name="${1:-}"
+  [ -n "$name" ] || { echo "usage: sdr monitor <name>" >&2; return 1; }
+  local log="$(sdr_logfile "$name")"
+  echo "Following $log (Ctrl-C to exit)"
+  if ! sdr_server_running "$name"; then
+    echo "${C_YELLOW}note: '$name' is not currently running${C_RESET}"
+  fi
+  touch "$log" 2>/dev/null
+  tail -f "$log"
+}
+
+cmd_run() {
+  sdr_load_config || return 1
+  local name="${1:-}"
+  sdr_valid_server "$name" || { echo "error: unknown server '$name'" >&2; return 1; }
+  sdr_build_cmd "$name"
+  exec "${CMD[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# init — auto-generate sdr.conf from attached devices
+# ---------------------------------------------------------------------------
+cmd_init() {
+  local out="$CONF_FILE" force=0 arg serial name st port=1234 servers="" body="" n=0
+  local -A used
+  for arg in "$@"; do
+    case "$arg" in
+      --force|-f) force=1 ;;
+      -h|--help)  echo "usage: sdr init [--force] [path]"; return 0 ;;
+      -*)         echo "error: unknown option '$arg'" >&2; return 1 ;;
+      *)          out="$arg" ;;
+    esac
+  done
+
+  sdr_scan
+
+  if [ "${#SDR_SERIALS[@]}" -eq 0 ]; then
+    echo "error: no RTL-SDR devices (0bda:2838) detected on the USB bus" >&2
+    return 1
+  fi
+
+  if [ -e "$out" ] && [ "$force" != "1" ]; then
+    echo "error: $out already exists — use --force to overwrite" >&2
+    return 1
+  fi
+
+  for serial in "${SDR_SERIALS[@]}"; do
+    st="${SDR_STATE[$serial]}"
+    if [ "$st" != "free" ]; then
+      echo "note: skipping serial $serial (${SDR_SYMLINK[$serial]:-—}) — $st" >&2
+      continue
+    fi
+
+    name="${SDR_SYMLINK[$serial]#rtl_sdr_}"
+    [ -z "$name" ] && name="sdr${n}"
+    name="$(printf '%s' "$name" | tr -c 'a-zA-Z0-9_' '_')"
+    [ -n "${used[$name]:-}" ] && name="${name}_${serial}"
+    used[$name]=1
+
+    servers="${servers}${name} "
+    body+="# --- ${name} (serial ${serial}: ${SDR_MANUFACTURER[$serial]} ${SDR_PRODUCT[$serial]}) ---
+SDR_${name}_SERIAL=\"${serial}\"
+SDR_${name}_PORT=\"${port}\"
+#SDR_${name}_FREQUENCY=\"\"
+#SDR_${name}_GAIN=\"0\"
+#SDR_${name}_SAMPLE_RATE=\"2048000\"
+
+"
+    port=$((port + 1))
+    n=$((n + 1))
+  done
+
+  [ -n "$servers" ] || { echo "error: no free devices to configure" >&2; return 1; }
+  servers="${servers% }"
+
+  {
+    echo "# Generated by: sdr init"
+    echo "# See sdr.conf.example for all available options."
+    echo
+    echo "LISTEN_ADDRESS=\"0.0.0.0\""
+    echo "DEFAULT_SAMPLE_RATE=\"2048000\""
+    echo "DEFAULT_GAIN=\"0\""
+    echo
+    echo "SERVERS=\"$servers\""
+    echo
+    printf '%s' "$body"
+  } > "$out"
+
+  echo "wrote $out"
+  echo "servers: $servers"
+  echo "next:    ./sdr start <name>   (or './sdr start all')"
+}
+
+# ---------------------------------------------------------------------------
+# dispatch
+# ---------------------------------------------------------------------------
+cmd="${1:-help}"
+shift || true
+case "$cmd" in
+  list|ls)       cmd_list ;;
+  status|st)     cmd_status "$@" ;;
+  init|setup)    cmd_init "$@" ;;
+  start)         cmd_start "$@" ;;
+  stop)          cmd_stop "$@" ;;
+  restart)       cmd_restart "$@" ;;
+  logs|log)      cmd_logs "$@" ;;
+  monitor|tail)  cmd_monitor "$@" ;;
+  run)           cmd_run "$@" ;;
+  help|-h|--help|"") usage ;;
+  *) echo "error: unknown command '$cmd'" >&2; echo; usage; exit 2 ;;
+esac

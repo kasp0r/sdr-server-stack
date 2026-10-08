@@ -1,0 +1,9 @@
+# Local, host-specific configuration (device serials, ports, etc.) — do not share.
+sdr.conf
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
