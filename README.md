@@ -64,18 +64,18 @@ systemd/sdr-rtl-tcp@.service  optional systemd unit template
 
 ## Commands
 
-| Command                  | Description                                        |
-|--------------------------|----------------------------------------------------|
-| `sdr list` / `ls`        | List physical dongles and their free/in-use state   |
-| `sdr status` / `st`      | Show configured servers and running state          |
-| `sdr init` / `setup`     | Auto-generate `sdr.conf` from attached free dongles |
-| `sdr start <name|all>`   | Start `rtl_tcp` for a server (or all)               |
-| `sdr stop <name|all>`    | Stop a server (or all)                              |
-| `sdr restart <name|all>` | Stop then start                                     |
-| `sdr logs <name>`        | Show recent log output                              |
-| `sdr monitor <name>`     | Follow a server's log                               |
-| `sdr run <name>`         | Run a server in the foreground (used by systemd)    |
-| `sdr help`               | Help                                                |
+| Command                       | Description                                        |
+|-------------------------------|----------------------------------------------------|
+| `sdr list` / `ls`             | List physical dongles and their free/in-use state   |
+| `sdr status` / `st`           | Show configured servers and running state          |
+| `sdr init` / `setup`          | Auto-generate `sdr.conf` from attached free dongles |
+| `sdr start <name|all>`        | Start `rtl_tcp` for a server (or all)               |
+| `sdr stop <name|all>`         | Stop a server (or all)                              |
+| `sdr restart <name|all>`      | Stop then start                                     |
+| `sdr logs <name>` / `log`     | Show recent log output                              |
+| `sdr monitor <name>` / `tail` | Follow a server's log                               |
+| `sdr run <name>`              | Run a server in the foreground (used by systemd)    |
+| `sdr help` / `-h` / `--help`  | Show help                                          |
 
 ## Configuration
 
